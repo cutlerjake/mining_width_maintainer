@@ -1,3 +1,5 @@
+use itertools::FoldWhile::{Continue, Done};
+use itertools::Itertools;
 use ndarray::{s, Array2};
 use ndarray_npy::NpzWriter;
 use std::fs::File;
@@ -36,7 +38,7 @@ impl BlockPerturbType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct NeighbordMask {
     mask: Array2<usize>,
     id: usize,
@@ -63,7 +65,7 @@ impl NeighbordMask {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct MiningWidthMaintainer {
     pub(crate) sched: Schedule,
     pub(crate) neighbor_mask: NeighbordMask,
@@ -125,6 +127,69 @@ impl MiningWidthMaintainer {
         self._fix_neighbors(&mut neighbors, mining_width.width as u8, period)
     }
 
+    fn best_covering_width(
+        &self,
+        ind: [usize; 3],
+        mining_width: u8,
+        period: u8,
+    ) -> SquareMiningWidth {
+        //if neighbor is not visited, then check if it is invalid
+        let covering_widths = SquareMiningWidth::gen_all_intersecting(
+            ind,
+            mining_width,
+            self.sched.sched.dim().into(),
+        );
+
+        return covering_widths
+            .iter()
+            .fold_while(
+                (
+                    SquareMiningWidth::new(ind, mining_width as usize),
+                    usize::MAX,
+                ),
+                |(best, best_count), cw| {
+                    let count = cw
+                        .inds(self.sched.sched.dim().into())
+                        .into_iter()
+                        .filter(|ind| self.sched.sched[*ind] == period)
+                        .count();
+                    if count < best_count {
+                        if count == 0 {
+                            return Done((*cw, count));
+                        }
+                        return Continue((*cw, count));
+                    } else {
+                        return Done((best, best_count));
+                    }
+                },
+            )
+            .into_inner()
+            .0;
+
+        // //println!("covering widths: {:?}", covering_widths);
+        // if covering_widths
+        //     .iter()
+        //     .any(|width| self.all_periods_same(width))
+        // {
+        //     // if neighbor is valid, skip
+        //     // Note we do not set neighbor as visited because it we have not cnaged its value
+        //     // modifying other neighbors may change require that this node also be changed
+        // }
+
+        // //if neighbor is invalid, then set it to current period
+        // let best_width = covering_widths
+        //     .iter()
+        //     .max_by_key(|cw| {
+        //         cw.inds(self.sched.sched.dim().into())
+        //             .iter()
+        //             .filter(|ind| self.sched.sched[**ind] == period)
+        //             .count()
+        //     })
+        //     .expect("Error unwraping best width");
+
+        // *best_width
+    }
+
     fn _fix_neighbors(
         &mut self,
         neighbors: &mut Vec<[usize; 3]>,
@@ -135,10 +200,12 @@ impl MiningWidthMaintainer {
             self.neighbor_ind_buffer.set_len(0);
         }
 
+        self.neighbor_ind_buffer.append(neighbors);
+
         let mut i = 0;
         let mut perturbed = Vec::with_capacity(10000);
-        while i < neighbors.len() {
-            let neighbor = neighbors[i];
+        while i < self.neighbor_ind_buffer.len() {
+            let neighbor = self.neighbor_ind_buffer[i];
             //if neighbor is already visited, then it is valid so skip
             if self.neighbor_mask.is_visited([neighbor[0], neighbor[1]])
                 || self.sched.sched[neighbor] == period
@@ -147,38 +214,15 @@ impl MiningWidthMaintainer {
                 continue;
             }
 
-            //if neighbor is not visited, then check if it is invalid
-            let covering_widths = SquareMiningWidth::gen_all_intersecting(
-                neighbor,
-                mining_width,
-                self.sched.sched.dim().into(),
-            );
+            let best_width = self.best_covering_width(neighbor, mining_width, period);
 
-            //println!("covering widths: {:?}", covering_widths);
-            if covering_widths
-                .iter()
-                .any(|width| self.all_periods_same(width))
-            {
-                // if neighbor is valid, skip
-                // Note we do not set neighbor as visited because it we have not cnaged its value
-                // modifying other neighbors may change require that this node also be changed
+            if self.all_periods_same(&best_width) {
                 i += 1;
                 continue;
             }
 
-            //if neighbor is invalid, then set it to current period
-            let best_width = covering_widths
-                .iter()
-                .max_by_key(|cw| {
-                    cw.inds(self.sched.sched.dim().into())
-                        .iter()
-                        .filter(|ind| self.sched.sched[**ind] == period)
-                        .count()
-                })
-                .expect("Error unwraping best width");
-
             //set neighbor to current period
-            let mut perturbed_inds = self.set_internal_inds(best_width, period);
+            let mut perturbed_inds = self.set_internal_inds(&best_width, period);
             perturbed_inds.retain(|perturbation| match perturbation {
                 BlockPerturbType::Unchanged(_) => false,
                 _ => true,
@@ -189,13 +233,12 @@ impl MiningWidthMaintainer {
             //set as visited
             let mut inds = best_width.inds(self.sched.sched.dim().into());
             inds.iter().for_each(|ind| {
-                if !self.neighbor_mask.is_visited([ind[0], ind[1]]) {
-                    self.neighbor_mask.visit([ind[0], ind[1]]);
-                }
+                self.neighbor_mask.visit([ind[0], ind[1]]);
             });
 
             //ADD NEIGHBORS TO LIST
-            neighbors.append(&mut best_width.neighbors(self.sched.sched.dim().into()));
+            self.neighbor_ind_buffer
+                .append(&mut best_width.neighbors(self.sched.sched.dim().into()));
             i += 1;
         }
 
@@ -241,34 +284,14 @@ impl MiningWidthMaintainer {
 
         let mut tmp = Vec::new();
         perturbed.iter().for_each(|pert| {
-            //if neighbor is not visited, then check if it is invalid
-            let covering_widths = SquareMiningWidth::gen_all_intersecting(
-                pert.origin(),
-                mining_width,
-                self.sched.sched.dim().into(),
-            );
+            let best_width = self.best_covering_width(pert.origin(), mining_width, period);
 
-            //if neighbor is invalid, then set it to current period
-            let best_width = covering_widths
-                .iter()
-                .max_by_key(|cw| {
-                    cw.inds(self.sched.sched.dim().into())
-                        .iter()
-                        .filter(|ind| self.sched.sched[**ind] == period)
-                        .count()
-                })
-                .expect("Error unwraping best width");
+            tmp.append(self.set_internal_inds(&best_width, period).as_mut());
 
-            self.set_internal_inds(best_width, period);
-
-            tmp.append(&mut self.fix_neighbors(best_width, period));
+            tmp.append(&mut self.fix_neighbors(&best_width, period));
         });
 
         perturbed.append(&mut tmp);
-        // let mut inds = perturbed
-        //     .iter()
-        //     .map(|pert| pert.origin())
-        //     .collect::<Vec<_>>();
 
         //perturbed.append(&mut self._fix_neighbors(&mut neighbors, mining_width, period));
         perturbed
@@ -298,12 +321,6 @@ impl MiningWidthMaintainer {
                     return BlockPerturbType::Unchanged(*ind);
                 }
 
-                // let mw = SquareMiningWidth::new(*ind, 1);
-                // neighbors.append(
-                //     mw.perimeter_of_width(self.sched.sched.dim().into(), mining_width as usize + 1)
-                //         .as_mut(),
-                // );
-                // neighbors.push(*ind);
                 let bp = BlockPerturbType::new(*ind, self.sched.sched[*ind], period);
 
                 self.sched.sched[*ind] = period;
@@ -313,27 +330,11 @@ impl MiningWidthMaintainer {
 
         let mut tmp = Vec::new();
         perturbed.iter().for_each(|pert| {
-            //if neighbor is not visited, then check if it is invalid
-            let covering_widths = SquareMiningWidth::gen_all_intersecting(
-                pert.origin(),
-                mining_width,
-                self.sched.sched.dim().into(),
-            );
+            let best_width = self.best_covering_width(pert.origin(), mining_width, period);
 
-            //if neighbor is invalid, then set it to current period
-            let best_width = covering_widths
-                .iter()
-                .max_by_key(|cw| {
-                    cw.inds(self.sched.sched.dim().into())
-                        .iter()
-                        .filter(|ind| self.sched.sched[**ind] == period)
-                        .count()
-                })
-                .expect("Error unwraping best width");
+            tmp.append(self.set_internal_inds(&best_width, period).as_mut());
 
-            self.set_internal_inds(best_width, period);
-
-            tmp.append(&mut self.fix_neighbors(best_width, period));
+            tmp.append(&mut self.fix_neighbors(&best_width, period));
         });
 
         perturbed.append(&mut tmp);
@@ -453,26 +454,27 @@ mod tests {
 
     #[test]
     fn fix_mining_width() {
-        let dim = [100, 100, 50];
+        let dim = [20, 20, 20];
         let mine_life = 10;
+        let mw = 3;
         let mut mining_width_maintainer = MiningWidthMaintainer::new(dim, mine_life);
 
         let mut rng = rand::thread_rng();
         for cnt in 0..1000 {
-            let i = rng.gen_range(0..97);
-            let j = rng.gen_range(0..97);
-            let k = rng.gen_range(0..50);
+            let i = rng.gen_range(0..17);
+            let j = rng.gen_range(0..17);
+            let k = rng.gen_range(0..20);
             let period = rng.gen_range(0..10);
-            let mining_width = SquareMiningWidth::new([i, j, k], 8);
+            let mining_width = SquareMiningWidth::new([i, j, k], mw);
             mining_width_maintainer.perturb(&mining_width, period);
             println!("Perturbed {} times", cnt);
-            // if !mining_width_maintainer.verify_mining_width(3) {
-            //     let mut npz = NpzWriter::new(File::create("arrays.npz").unwrap());
-            //     npz.add_array("sched", &mining_width_maintainer.sched.sched)
-            //         .unwrap();
-            //     npz.finish().unwrap();
-            //     panic!();
-            // }
+            if !mining_width_maintainer.verify_mining_width(mw as u8) {
+                let mut npz = NpzWriter::new(File::create("arrays.npz").unwrap());
+                npz.add_array("sched", &mining_width_maintainer.sched.sched)
+                    .unwrap();
+                npz.finish().unwrap();
+                panic!();
+            }
         }
 
         let mut npz = NpzWriter::new(File::create("arrays.npz").unwrap());

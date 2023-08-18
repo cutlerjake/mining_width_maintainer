@@ -1,6 +1,7 @@
 use itertools::iproduct;
 use ndarray::Array3;
 
+#[derive(Clone, Debug)]
 pub struct Schedule {
     pub sched: Array3<u8>,
     pub max_period: u8,
