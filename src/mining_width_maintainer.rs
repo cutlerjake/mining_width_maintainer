@@ -1,6 +1,6 @@
 use itertools::FoldWhile::{Continue, Done};
 use itertools::Itertools;
-use ndarray::{s, Array2};
+use ndarray::{s, Array3};
 use ndarray_npy::NpzWriter;
 use std::fs::File;
 
@@ -40,14 +40,14 @@ impl BlockPerturbType {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NeighbordMask {
-    mask: Array2<usize>,
+    mask: Array3<usize>,
     id: usize,
 }
 
 impl NeighbordMask {
     fn new(dim: [usize; 3]) -> Self {
         Self {
-            mask: Array2::from_elem([dim[0], dim[1]], 0),
+            mask: Array3::from_elem(dim, 0),
             id: 0,
         }
     }
@@ -56,12 +56,20 @@ impl NeighbordMask {
         self.id += 1;
     }
 
-    fn visit(&mut self, ind: [usize; 2]) {
+    fn visit(&mut self, ind: [usize; 3]) {
         self.mask[ind] = self.id;
     }
 
-    fn is_visited(&self, ind: [usize; 2]) -> bool {
+    fn is_visited(&self, ind: [usize; 3]) -> bool {
         self.mask[ind] == self.id
+    }
+
+    fn curr_id(&self) -> usize {
+        self.id
+    }
+
+    fn mask(&self) -> &Array3<usize> {
+        &self.mask
     }
 }
 
@@ -165,7 +173,24 @@ impl MiningWidthMaintainer {
         mining_width
             .inds(self.sched.sched.dim().into())
             .iter()
-            .for_each(|ind| self.neighbor_mask.visit([ind[0], ind[1]]));
+            .for_each(|ind| self.neighbor_mask.visit(*ind));
+
+        //get original set of neighbors
+        let mut neighbors = mining_width.neighbors(self.sched.sched.dim().into());
+
+        self._fix_neighbors(&mut neighbors, mining_width.width as u8, period)
+    }
+
+    fn fix_neighbors_no_mask_reset(
+        &mut self,
+        mining_width: &SquareMiningWidth,
+        period: u8,
+    ) -> Vec<BlockPerturbType> {
+        //set internal nodes as visited
+        mining_width
+            .inds(self.sched.sched.dim().into())
+            .iter()
+            .for_each(|ind| self.neighbor_mask.visit(*ind));
 
         //get original set of neighbors
         let mut neighbors = mining_width.neighbors(self.sched.sched.dim().into());
@@ -188,9 +213,7 @@ impl MiningWidthMaintainer {
         while i < neighbors.len() {
             let neighbor = neighbors[i];
             //if neighbor is already visited, then it is valid so skip
-            if self.neighbor_mask.is_visited([neighbor[0], neighbor[1]])
-                || self.sched.sched[neighbor] == period
-            {
+            if self.neighbor_mask.is_visited(neighbor) || self.sched.sched[neighbor] == period {
                 i += 1;
                 continue;
             }
@@ -214,8 +237,8 @@ impl MiningWidthMaintainer {
             //set as visited
             let mut inds = best_width.inds(self.sched.sched.dim().into());
             inds.iter().for_each(|ind| {
-                if !self.neighbor_mask.is_visited([ind[0], ind[1]]) {
-                    self.neighbor_mask.visit([ind[0], ind[1]]);
+                if !self.neighbor_mask.is_visited(*ind) {
+                    self.neighbor_mask.visit(*ind);
                 }
             });
 
@@ -232,9 +255,10 @@ impl MiningWidthMaintainer {
         ind: [usize; 3],
         mining_width: u8,
         period: u8,
+        curr_mask_id: usize,
     ) -> Vec<BlockPerturbType> {
         //reset neighbor mask
-        self.neighbor_mask.reset();
+        //self.neighbor_mask.reset();
 
         //let mut neighbors = Vec::new();
 
@@ -251,12 +275,6 @@ impl MiningWidthMaintainer {
                     return BlockPerturbType::Unchanged(*ind);
                 }
 
-                // let mw = SquareMiningWidth::new(*ind, 1);
-                // neighbors.append(
-                //     mw.perimeter_of_width(self.sched.sched.dim().into(), mining_width as usize + 1)
-                //         .as_mut(),
-                // );
-                // neighbors.push(*ind);
                 let bp = BlockPerturbType::new(*ind, self.sched.sched[*ind], period);
 
                 self.sched.sched[*ind] = period;
@@ -266,10 +284,7 @@ impl MiningWidthMaintainer {
 
         let mut tmp = Vec::new();
         perturbed.iter().for_each(|pert| {
-            if self
-                .neighbor_mask
-                .is_visited([pert.origin()[0], pert.origin()[1]])
-            {
+            if self.neighbor_mask.mask()[pert.origin()] >= curr_mask_id {
                 return;
             }
 
@@ -280,17 +295,13 @@ impl MiningWidthMaintainer {
                 .inds(self.sched.sched.dim().into())
                 .iter()
                 .for_each(|ind| {
-                    self.neighbor_mask.visit([ind[0], ind[1]]);
+                    self.neighbor_mask.visit(*ind);
                 });
 
-            tmp.append(&mut self.fix_neighbors(&best_width, period));
+            tmp.append(&mut &mut self.fix_neighbors_no_mask_reset(&best_width, period));
         });
 
         perturbed.append(&mut tmp);
-        // let mut inds = perturbed
-        //     .iter()
-        //     .map(|pert| pert.origin())
-        //     .collect::<Vec<_>>();
 
         //perturbed.append(&mut self._fix_neighbors(&mut neighbors, mining_width, period));
         perturbed
@@ -301,6 +312,7 @@ impl MiningWidthMaintainer {
         ind: [usize; 3],
         mining_width: u8,
         period: u8,
+        curr_mask_id: usize,
     ) -> Vec<BlockPerturbType> {
         //reset neighbor mask
         self.neighbor_mask.reset();
@@ -320,12 +332,6 @@ impl MiningWidthMaintainer {
                     return BlockPerturbType::Unchanged(*ind);
                 }
 
-                // let mw = SquareMiningWidth::new(*ind, 1);
-                // neighbors.append(
-                //     mw.perimeter_of_width(self.sched.sched.dim().into(), mining_width as usize + 1)
-                //         .as_mut(),
-                // );
-                // neighbors.push(*ind);
                 let bp = BlockPerturbType::new(*ind, self.sched.sched[*ind], period);
 
                 self.sched.sched[*ind] = period;
@@ -335,10 +341,7 @@ impl MiningWidthMaintainer {
 
         let mut tmp = Vec::new();
         perturbed.iter().for_each(|pert| {
-            if self
-                .neighbor_mask
-                .is_visited([pert.origin()[0], pert.origin()[1]])
-            {
+            if self.neighbor_mask.mask()[pert.origin()] >= curr_mask_id {
                 return;
             }
             let (best_width, delta) = self.best_covering_width(pert.origin(), mining_width, period);
@@ -348,10 +351,10 @@ impl MiningWidthMaintainer {
                 .inds(self.sched.sched.dim().into())
                 .iter()
                 .for_each(|ind| {
-                    self.neighbor_mask.visit([ind[0], ind[1]]);
+                    self.neighbor_mask.visit(*ind);
                 });
 
-            tmp.append(&mut self.fix_neighbors(&best_width, period));
+            tmp.append(&mut &mut self.fix_neighbors_no_mask_reset(&best_width, period));
         });
 
         perturbed.append(&mut tmp);
@@ -366,16 +369,45 @@ impl MiningWidthMaintainer {
         mining_width: u8,
         period: u8,
     ) {
+        self.neighbor_mask.reset();
+        let curr_id = self.neighbor_mask.curr_id();
         let mut i = 0;
+
         while i < peturbed.len() {
             let pert = peturbed[i];
             match pert {
                 BlockPerturbType::Advanced(ind, delta) => {
-                    let mut fix_perturbed = self.fix_preds(ind, mining_width, period);
+                    let mut fix_perturbed = self.fix_preds(ind, mining_width, period, curr_id);
                     peturbed.append(&mut fix_perturbed);
                 }
                 BlockPerturbType::Delayed(ind, delta) => {
-                    let mut fix_perturbed = self.fix_succs(ind, mining_width, period);
+                    let mut fix_perturbed = self.fix_succs(ind, mining_width, period, curr_id);
+                    peturbed.append(&mut fix_perturbed);
+                }
+                BlockPerturbType::Unchanged(ind) => {}
+            }
+            i += 1;
+        }
+    }
+
+    fn fix_preds_and_succs_no_reset(
+        &mut self,
+        peturbed: &mut Vec<BlockPerturbType>,
+        mining_width: u8,
+        period: u8,
+        curr_mask_id: usize,
+    ) {
+        let mut i = 0;
+
+        while i < peturbed.len() {
+            let pert = peturbed[i];
+            match pert {
+                BlockPerturbType::Advanced(ind, delta) => {
+                    let mut fix_perturbed = self.fix_preds(ind, mining_width, period, curr_mask_id);
+                    peturbed.append(&mut fix_perturbed);
+                }
+                BlockPerturbType::Delayed(ind, delta) => {
+                    let mut fix_perturbed = self.fix_succs(ind, mining_width, period, curr_mask_id);
                     peturbed.append(&mut fix_perturbed);
                 }
                 BlockPerturbType::Unchanged(ind) => {}
@@ -389,10 +421,17 @@ impl MiningWidthMaintainer {
         let mut perturbed_nodes = self.set_internal_inds(mining_width, period);
 
         // fix neighbors violating mining width
-        perturbed_nodes.append(&mut self.fix_neighbors(mining_width, period));
+        self.neighbor_mask.reset();
+        let curr_id = self.neighbor_mask.curr_id();
+        perturbed_nodes.append(&mut &mut self.fix_neighbors_no_mask_reset(mining_width, period));
 
         //fix preds and succs
-        self.fix_preds_and_succs(&mut perturbed_nodes, mining_width.width as u8, period);
+        self.fix_preds_and_succs_no_reset(
+            &mut perturbed_nodes,
+            mining_width.width as u8,
+            period,
+            curr_id,
+        );
     }
 
     fn verify_mining_width(&self, mining_width: u8) -> bool {
@@ -471,15 +510,19 @@ mod tests {
 
     #[test]
     fn fix_mining_width() {
-        let dim = [20, 20, 20];
+        let i_size = 100;
+        let j_size = 100;
+        let k_size = 100;
+        let mw = 4;
+        let dim = [i_size, j_size, k_size];
         let mine_life = 10;
         let mut mining_width_maintainer = MiningWidthMaintainer::new(dim, mine_life);
-        let mw = 4;
+
         let mut rng = rand::thread_rng();
         for cnt in 0..1000 {
-            let i = rng.gen_range(0..17);
-            let j = rng.gen_range(0..17);
-            let k = rng.gen_range(0..20);
+            let i = rng.gen_range(0..i_size - mw);
+            let j = rng.gen_range(0..j_size - mw);
+            let k = rng.gen_range(0..k_size);
             let period = rng.gen_range(0..10);
             let mining_width = SquareMiningWidth::new([i, j, k], mw);
             mining_width_maintainer.perturb(&mining_width, period);
