@@ -28,6 +28,11 @@ impl SquareMiningWidth {
     }
 
     #[inline(always)]
+    pub fn bench(&self) -> usize {
+        self.origin[2]
+    }
+
+    #[inline(always)]
     pub fn gen_all_intersecting(ind: [usize; 3], mining_width: u8, dim: [usize; 3]) -> Vec<Self> {
         let mut mining_widths = Vec::new();
         let i_rng = clamp_range(
