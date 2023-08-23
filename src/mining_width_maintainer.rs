@@ -4,6 +4,7 @@ use ndarray::{s, Array3};
 use ndarray_npy::NpzWriter;
 use std::fs::File;
 
+use crate::mining_width;
 use crate::{mining_width::SquareMiningWidth, schedule::Schedule};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -553,6 +554,60 @@ impl MiningWidthMaintainer {
             }));
     }
 
+    fn fix_preds_no_mw_repair_iter(
+        &mut self,
+        ind: [usize; 3],
+        mining_width: u8,
+        period: u8,
+        curr_mask_id: usize,
+    ) -> impl Iterator<Item = BlockPerturbType> + '_ {
+        self.sched.preds(ind).into_iter().map(move |pred| {
+            //visit ind
+            //self.neighbor_mask.visit([ind[0], ind[1]]);
+
+            if self.sched.sched[pred] == period {
+                self.neighbor_mask.visit(pred);
+                return BlockPerturbType::Unchanged(pred);
+            }
+
+            if self.sched.sched[pred] < period {
+                return BlockPerturbType::Unchanged(pred);
+            }
+
+            let bp = BlockPerturbType::new(pred, self.sched.sched[pred], period);
+
+            self.sched.sched[pred] = period;
+            bp
+        })
+    }
+
+    fn fix_succs_no_mw_repair_iter(
+        &mut self,
+        ind: [usize; 3],
+        mining_width: u8,
+        period: u8,
+        curr_mask_id: usize,
+    ) -> impl Iterator<Item = BlockPerturbType> + '_ {
+        self.sched.succs(ind).into_iter().map(move |succ| {
+            //visit ind
+            //self.neighbor_mask.visit([ind[0], ind[1]]);
+
+            if self.sched.sched[succ] == period {
+                self.neighbor_mask.visit(succ);
+                return BlockPerturbType::Unchanged(succ);
+            }
+
+            if self.sched.sched[succ] > period {
+                return BlockPerturbType::Unchanged(succ);
+            }
+
+            let bp = BlockPerturbType::new(succ, self.sched.sched[succ], period);
+
+            self.sched.sched[succ] = period;
+            bp
+        })
+    }
+
     fn fix_preds_and_succs_no_reset(&mut self, mining_width: u8, period: u8, curr_mask_id: usize) {
         let mut i = 0;
         let mut neighbors = Vec::new();
@@ -619,13 +674,140 @@ impl MiningWidthMaintainer {
         }
     }
 
-    fn fix_by_bench(&mut self, perturbation: &SquareMiningWidth, period: u8) {
+    fn fix_immediate_preds_and_succs_no_reset(
+        &mut self,
+        perturbed: &Vec<BlockPerturbType>,
+        mining_width: u8,
+        period: u8,
+        curr_mask_id: usize,
+        bench_buffer: &mut Vec<Vec<BlockPerturbType>>,
+    ) {
+        //fix all preds and succs
+        for pert in perturbed {
+            match pert {
+                BlockPerturbType::Advanced(ind, delta) => {
+                    let mut fix_perturbed =
+                        self.fix_preds_no_mw_repair_iter(*ind, mining_width, period, curr_mask_id);
+
+                    fix_perturbed.for_each(|pert| match pert {
+                        BlockPerturbType::Unchanged(ind) => {}
+                        _ => bench_buffer[pert.origin()[2]].push(pert),
+                    });
+                    //peturbed.append(&mut fix_perturbed);
+                }
+                BlockPerturbType::Delayed(ind, delta) => {
+                    let mut fix_perturbed =
+                        self.fix_succs_no_mw_repair_iter(*ind, mining_width, period, curr_mask_id);
+
+                    fix_perturbed.for_each(|pert| match pert {
+                        BlockPerturbType::Unchanged(ind) => {}
+                        _ => bench_buffer[pert.origin()[2]].push(pert),
+                    });
+
+                    //fix_perturbed.for_each(|pert| bench_buffer[pert.origin()[2]].push(pert));
+                    //peturbed.append(&mut fix_perturbed);
+                }
+                BlockPerturbType::Unchanged(ind) => {}
+            }
+        }
+    }
+
+    fn fix_by_bench(
+        &mut self,
+        perturbation: &SquareMiningWidth,
+        period: u8,
+        buffer: &mut Vec<BlockPerturbType>,
+    ) {
         self.neighbor_mask.reset();
         let mut bench_buffer: Vec<Vec<BlockPerturbType>> =
             vec![Vec::new(); self.sched.sched.dim().2];
 
         bench_buffer[perturbation.bench()]
             .append(&mut self.set_internal_inds(perturbation, period));
+
+        let mut done = false;
+
+        let mut bench_order = (0..self.sched.sched.dim().2).collect::<Vec<_>>();
+        bench_order.sort_by_key(|bench| bench.abs_diff(perturbation.bench()));
+
+        //let mut new_buffer = Vec::new();
+
+        while !done {
+            done = true;
+            //fix neighbors on perturbation bench or nearest above
+            for &bench in bench_order.iter() {
+                if bench_buffer[bench].len() == 0 {
+                    continue;
+                }
+                done = false;
+
+                // println!(
+                //     "Working on bench: {} for perturbation: {:?}",
+                //     bench, perturbation
+                // );
+                // println!("Bench: {}", bench);
+                // println!("Perturbed inds: {:?}", bench_buffer[bench]);
+                let len = bench_buffer[bench].len();
+
+                //println!("{:?}", bench_buffer[bench][1]);
+
+                self.neighbor_mask.reset();
+                for pert_i in 0..len {
+                    if self
+                        .neighbor_mask
+                        .is_visited(bench_buffer[bench][pert_i].origin())
+                    {
+                        continue;
+                    }
+
+                    //get best covering width
+                    let (best_width, delta) = self.best_covering_width(
+                        bench_buffer[bench][pert_i].origin(),
+                        perturbation.width as u8,
+                        period,
+                    );
+
+                    if let BlockPerturbType::Unchanged(ind) = bench_buffer[bench][pert_i] {
+                        if delta == 0 && self.sched.sched[ind] == period {
+                            self.neighbor_mask.visit(ind);
+
+                            continue;
+                        }
+                    }
+
+                    //set internal inds
+                    if delta != 0 {
+                        bench_buffer[bench]
+                            .append(&mut self.set_internal_inds(&best_width, period));
+                    }
+
+                    //fix neighbors
+
+                    self.fix_neighbors_no_mask_reset_with_buffer(
+                        &best_width,
+                        period,
+                        &mut bench_buffer[bench],
+                    );
+                }
+
+                unsafe {
+                    buffer.set_len(0);
+                }
+                std::mem::swap(buffer, &mut bench_buffer[bench]);
+
+                //fix immediate preds and succs
+                self.fix_immediate_preds_and_succs_no_reset(
+                    &buffer,
+                    perturbation.width as u8,
+                    period,
+                    self.neighbor_mask.curr_id(),
+                    &mut bench_buffer,
+                );
+
+                break;
+            }
+            //fix neighbors on perturbation bench or nearest below
+        }
     }
 
     pub fn perturb(&mut self, mining_width: &SquareMiningWidth, period: u8) {
@@ -774,9 +956,10 @@ mod tests {
         let dim = [i_size, j_size, k_size];
         let mine_life = 10;
         let mut mining_width_maintainer = MiningWidthMaintainer::new(dim, mine_life);
+        let mut buffer = Vec::new();
 
         let mining_width = SquareMiningWidth::new([10, 10, 10], mw);
-        mining_width_maintainer.perturb(&mining_width, 1);
+        mining_width_maintainer.fix_by_bench(&mining_width, 1, &mut buffer);
         // if !mining_width_maintainer.verify_mining_width(mw as u8) {
         //     let mut npz = NpzWriter::new(File::create("arrays.npz").unwrap());
         //     npz.add_array("sched", &mining_width_maintainer.sched.sched)
@@ -800,7 +983,7 @@ mod tests {
         let dim = [i_size, j_size, k_size];
         let mine_life = 10;
         let mut mining_width_maintainer = MiningWidthMaintainer::new(dim, mine_life);
-
+        let mut buffer = Vec::new();
         let mut rng = rand::thread_rng();
         for cnt in 0..1000 {
             let i = rng.gen_range(0..i_size - mw);
@@ -808,20 +991,20 @@ mod tests {
             let k = rng.gen_range(0..k_size);
             let period = rng.gen_range(0..10);
             let mining_width = SquareMiningWidth::new([i, j, k], mw);
-            mining_width_maintainer.perturb(&mining_width, period);
+            mining_width_maintainer.fix_by_bench(&mining_width, period, &mut buffer);
             println!(
                 "Perturbed {} times, perturbation: {:?}, {}",
                 cnt,
                 [i, j, k],
                 period
             );
-            if !mining_width_maintainer.verify_mining_width(4) {
-                let mut npz = NpzWriter::new(File::create("arrays.npz").unwrap());
-                npz.add_array("sched", &mining_width_maintainer.sched.sched)
-                    .unwrap();
-                npz.finish().unwrap();
-                panic!();
-            }
+            // if !mining_width_maintainer.verify_mining_width(4) {
+            //     let mut npz = NpzWriter::new(File::create("arrays.npz").unwrap());
+            //     npz.add_array("sched", &mining_width_maintainer.sched.sched)
+            //         .unwrap();
+            //     npz.finish().unwrap();
+            //     panic!();
+            // }
 
             if cnt % 10 == 0 {
                 let mut npz = NpzWriter::new(File::create(format!("arrays_{cnt}.npz")).unwrap());
