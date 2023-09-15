@@ -1,10 +1,7 @@
 use itertools::FoldWhile::{Continue, Done};
 use itertools::Itertools;
-use ndarray::{s, Array3};
-use ndarray_npy::NpzWriter;
-use std::fs::File;
+use ndarray::Array3;
 
-use crate::mining_width;
 use crate::{mining_width::SquareMiningWidth, schedule::Schedule};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -557,9 +554,7 @@ impl MiningWidthMaintainer {
     fn fix_preds_no_mw_repair_iter(
         &mut self,
         ind: [usize; 3],
-        mining_width: u8,
         period: u8,
-        curr_mask_id: usize,
     ) -> impl Iterator<Item = BlockPerturbType> + '_ {
         self.sched.preds(ind).into_iter().map(move |pred| {
             //visit ind
@@ -584,9 +579,7 @@ impl MiningWidthMaintainer {
     fn fix_succs_no_mw_repair_iter(
         &mut self,
         ind: [usize; 3],
-        mining_width: u8,
         period: u8,
-        curr_mask_id: usize,
     ) -> impl Iterator<Item = BlockPerturbType> + '_ {
         self.sched.succs(ind).into_iter().map(move |succ| {
             //visit ind
@@ -611,21 +604,19 @@ impl MiningWidthMaintainer {
     fn fix_preds_and_succs_no_reset(&mut self, mining_width: u8, period: u8, curr_mask_id: usize) {
         let mut i = 0;
         let mut neighbors = Vec::new();
-        let mut loop_cnt = 0;
         while self.perturbed_ind_buffer.len() > 0 {
             //println!("Loop: {}", loop_cnt);
-            loop_cnt += 1;
             //fix all preds and succs
             while i < self.perturbed_ind_buffer.len() {
                 let pert = self.perturbed_ind_buffer[i];
                 match pert {
-                    BlockPerturbType::Advanced(ind, delta) => {
-                        let mut fix_perturbed =
+                    BlockPerturbType::Advanced(ind, _) => {
+                        let fix_perturbed =
                             self.fix_preds_no_mw_repair(ind, mining_width, period, curr_mask_id);
                         //peturbed.append(&mut fix_perturbed);
                     }
-                    BlockPerturbType::Delayed(ind, delta) => {
-                        let mut fix_perturbed =
+                    BlockPerturbType::Delayed(ind, _) => {
+                        let fix_perturbed =
                             self.fix_succs_no_mw_repair(ind, mining_width, period, curr_mask_id);
                         //peturbed.append(&mut fix_perturbed);
                     }
@@ -639,16 +630,14 @@ impl MiningWidthMaintainer {
             //fix neighbors
             for pert_i in 0..self.perturbed_ind_buffer.len() {
                 match self.perturbed_ind_buffer[pert_i] {
-                    BlockPerturbType::Advanced(ind, delta)
-                    | BlockPerturbType::Delayed(ind, delta) => {
+                    BlockPerturbType::Advanced(ind, _) | BlockPerturbType::Delayed(ind, _) => {
                         //if neighbor is already visited or in the same period, then it is valid so skip
                         if self.neighbor_mask.is_visited(ind) {
                             continue;
                         }
 
                         //otherwise get best covering width
-                        let (best_width, delta) =
-                            self.best_covering_width(ind, mining_width, period);
+                        let (best_width, _) = self.best_covering_width(ind, mining_width, period);
 
                         self.set_internal_inds(&best_width, period);
 
@@ -685,34 +674,32 @@ impl MiningWidthMaintainer {
         //fix all preds and succs
         for pert in perturbed {
             match pert {
-                BlockPerturbType::Advanced(ind, delta) => {
-                    let mut fix_perturbed =
-                        self.fix_preds_no_mw_repair_iter(*ind, mining_width, period, curr_mask_id);
+                BlockPerturbType::Advanced(ind, _) => {
+                    let fix_perturbed = self.fix_preds_no_mw_repair_iter(*ind, period);
 
                     fix_perturbed.for_each(|pert| match pert {
-                        BlockPerturbType::Unchanged(ind) => {}
+                        BlockPerturbType::Unchanged(_) => {}
                         _ => bench_buffer[pert.origin()[2]].push(pert),
                     });
                     //peturbed.append(&mut fix_perturbed);
                 }
-                BlockPerturbType::Delayed(ind, delta) => {
-                    let mut fix_perturbed =
-                        self.fix_succs_no_mw_repair_iter(*ind, mining_width, period, curr_mask_id);
+                BlockPerturbType::Delayed(ind, _) => {
+                    let fix_perturbed = self.fix_succs_no_mw_repair_iter(*ind, period);
 
                     fix_perturbed.for_each(|pert| match pert {
-                        BlockPerturbType::Unchanged(ind) => {}
+                        BlockPerturbType::Unchanged(_) => {}
                         _ => bench_buffer[pert.origin()[2]].push(pert),
                     });
 
                     //fix_perturbed.for_each(|pert| bench_buffer[pert.origin()[2]].push(pert));
                     //peturbed.append(&mut fix_perturbed);
                 }
-                BlockPerturbType::Unchanged(ind) => {}
+                BlockPerturbType::Unchanged(_) => {}
             }
         }
     }
 
-    fn fix_by_bench(
+    pub fn fix_by_bench(
         &mut self,
         perturbation: &SquareMiningWidth,
         period: u8,
@@ -828,8 +815,8 @@ impl MiningWidthMaintainer {
         self.fix_preds_and_succs_no_reset(mining_width.width as u8, period, curr_id);
     }
 
-    fn verify_mining_width(&self, mining_width: u8) -> bool {
-        self.sched.sched.indexed_iter().all(|(ind, period)| {
+    pub fn verify_mining_width(&self, mining_width: u8) -> bool {
+        self.sched.sched.indexed_iter().all(|(ind, _)| {
             //if neighbor is not visited, then check if it is invalid
             let covering_widths = SquareMiningWidth::gen_all_intersecting(
                 ind.into(),
@@ -863,9 +850,10 @@ impl MiningWidthMaintainer {
 
 #[cfg(test)]
 mod tests {
+    use ndarray::s;
+    use ndarray_npy::NpzWriter;
     use rand::Rng;
-
-    use crate::mining_width;
+    use std::fs::File;
 
     use super::*;
 
@@ -875,7 +863,7 @@ mod tests {
         let mine_life = 10;
         let mut mining_width_maintainer = MiningWidthMaintainer::new(dim, mine_life);
         let mining_width = SquareMiningWidth::new([0, 0, 0], 3);
-        let perturbed_inds = mining_width_maintainer.set_internal_inds(&mining_width, 5);
+        mining_width_maintainer.set_internal_inds(&mining_width, 5);
         assert_eq!(mining_width_maintainer.sched.sched[[0, 0, 0]], 5);
         assert_eq!(mining_width_maintainer.sched.sched[[2, 2, 0]], 5);
     }
